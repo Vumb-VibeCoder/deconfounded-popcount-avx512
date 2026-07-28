@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2026 Hoang Gia Bao
+ * Developed as part of the IRM-Burst Microarchitectural Diagnostic Framework.
+ * Licensed under the MIT License. See LICENSE file in the project root for details.
+ */
 // ============================================================
 // popcount_v21_combined.cpp — Unified v18 + v19 + v21 (SIMD + RDTSCP)
 //
