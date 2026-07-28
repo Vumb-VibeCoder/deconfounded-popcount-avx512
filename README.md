@@ -75,14 +75,14 @@ When evaluating theoretical microarchitectural bounds, AI models (like xAI's Gro
 
 ```bash
 # Clone the repository
-git clone [https://github.com/your-username/your-repo-name.git](https://github.com/your-username/your-repo-name.git)
-cd your-repo-name
+git clone https://github.com/Vumb-VibeCoder/deconfounded-popcount-avx512.git
+cd deconfounded-popcount-avx512
 
 # Compile portable build
-g++ -O3 -std=c++20 main.cpp -o popcount_portable
+g++ -O3 -std=c++20 popcount_v33.cpp -o popcount_portable
 
 # Compile native build (AVX-512 target)
-g++ -O3 -march=native -std=c++20 main.cpp -o popcount_native
+g++ -O3 -march=native -std=c++20 popcount_v33.cpp -o popcount_native
 
 # Pin to physical core 0 for clean benchmarking
 taskset -c 0 ./popcount_native
