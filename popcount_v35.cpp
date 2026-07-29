@@ -1,3 +1,12 @@
+//#if !defined(__GNUC__) && !defined(__clang__)
+   // #error "File nay bắt buộc sử dụng trình biên dịch GCC hoặc Clang."
+//#endif
+//#if !defined(__linux__)
+    //#error "File này phụ thuộc vào Linux syscalls (<sys/mman.h>, <linux/perf_event.h>)."
+//#endif
+//#if __cplusplus < 201703L
+   // #error "Yêu cầu chuẩn C++17 trở lên (-std=c++17)."
+//#endif
 // ============================================================
 // popcount_v21_combined.cpp — Unified v18 + v19 + v21 (SIMD + RDTSCP)
 //
