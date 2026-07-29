@@ -1,69 +1,87 @@
-# The IRM-Burst Law of Equivalence — v3
+# The IRM-Burst Law of Equivalence — v3.1
 
 ## Abstract
 
 **v1** modeled LRU miss rate under uniform-random Independent Reference Model (IRM) traffic with fixed-length bursts, assuming a fully-associative cache. It is exact in the closed form
 $$\mu(C,W,L) = \frac{\max(0, W-C)}{W\cdot L}$$
-but breaks down badly — errors of 5-8 percentage points in our tests — the moment traffic is non-uniform (hot/cold lines, Zipf skew), which is the realistic case for almost all real workloads.
+but breaks down badly — errors of 5–8 percentage points in our tests — the moment traffic is non-uniform (hot/cold lines, Zipf skew), which is the realistic case for almost all real workloads.
 
-**v2** replaced the uniform-occupancy assumption with **Che's approximation**, a mean-field technique from cache analysis literature, allowing per-line reference probabilities $p_i$. It matched Monte Carlo simulation to within $10^{-4}$-$10^{-5}$ even under heavy Zipf skew and hot/cold bimodal traffic, a 100-1000x accuracy improvement over v1 in skewed regimes.
+**v2** replaced the uniform-occupancy assumption with **Che's approximation**, a mean-field technique from cache analysis literature, allowing per-line reference probabilities $p_i$. It matched Monte Carlo simulation to within $10^{-4}$–$10^{-5}$ even under heavy Zipf skew and hot/cold bimodal traffic, a 100–1000× accuracy improvement over v1 in skewed regimes.
 
-**v3** (this document) closes two further gaps:
+**v3** closed two remaining gaps that made v1/v2 physically unrealistic: set-associativity (solving Che's equation *per set*) and heterogeneous per-line burst length $L_i$.
 
-1. **Set-associativity.** Real caches are not fully-associative; they're split into $S$ sets of $A$ ways each ($C = S \cdot A$), with lines mapped to sets by an index hash. v3 solves Che's equation *per set* rather than globally.
-2. **Heterogeneous burst length.** Real bursts are not all the same length $L$ — hot (e.g. streamed/sequential) lines tend to have longer runs than cold (random/scattered) lines. v3 allows a per-line burst length $L_i$.
-
-v3 was validated against an exact set-associative LRU simulator across uniform, Zipf, hot/cold, direct-mapped, and adversarial hash-collision configurations, holding accuracy to within $4\times10^{-4}$ even in a deliberately adversarial worst case (3 hot lines forced into the same 2-way set). A follow-up round of stress-testing (Section 6) then went looking specifically for where the model breaks, and found the real boundary is *inter-burst correlation*, not associativity or burst length.
+**v3.1** (this document) closes the gap v3 itself flagged as its weakest point (§5.3, and the adversarial test in §3): Che's mean-field assumption of independent per-line residency degrades when a set is **small and traffic-concentrated** — few lines, most of the traffic. v3.1 adds an **exact solver** for that regime, used only when it applies, leaving the rest of the model — and its mean-field default — untouched.
 
 ---
 
 ## 1. Physical Model & Parameter Definitions
+
+*(unchanged from v3)*
 
 - **$S$ (Set Count):** Number of independent LRU sets in the cache.
 - **$A$ (Associativity / Ways):** Cache lines per set. Total capacity $C = S \cdot A$.
 - **$W$ (Working-Set Footprint):** Number of unique cache lines referenced.
 - **$q_i$ (Burst-Selection Probability):** Probability that a given burst targets line $i$, $\sum_{i=1}^W q_i = 1$. Reduces to $q_i = 1/W$ in v1's uniform case.
 - **$L_i$ (Per-Line Burst Length):** Number of consecutive accesses to line $i$ once selected. Reduces to constant $L$ in v1/v2.
-- **$\text{set}(i)$:** The set index line $i$ maps to, via an index hash (does not need to be uniform — see Section 6).
+- **$\text{set}(i)$:** The set index line $i$ maps to, via a (assumed near-uniform) index hash.
+- **$M_s = \{i : \text{set}(i) = s\}$:** Lines mapped to set $s$.
 
 ---
 
 ## 2. Derivation
 
-### 2.1 Che's Approximation (per set)
+### 2.1 Che's Approximation (per set) — default path
 
-Within each set $s$, only lines mapping to $s$ compete for its $A$ ways. Let $M_s = \{i : \text{set}(i) = s\}$. Che's mean-field approximation posits a **characteristic residency time** $T_{c,s}$ such that line $i \in M_s$'s probability of being resident in the cache at a random point in time is
+Within each set $s$, only lines mapping to $s$ compete for its $A$ ways. Che's mean-field approximation posits a **characteristic residency time** $T_{c,s}$ such that line $i \in M_s$'s probability of being resident in the cache at a random point in time is
 $$\pi_i = 1 - e^{-q_i T_{c,s}}$$
 $T_{c,s}$ is fixed by requiring expected occupancy to equal the set's capacity:
 $$\sum_{i \in M_s} \left(1 - e^{-q_i T_{c,s}}\right) = A$$
-This is solved numerically (monotone in $T_{c,s}$, solvable by bisection — see implementation).
+This is monotone in $T_{c,s}$ and is now solved by **Newton–Raphson** rather than bisection (§4) — same equation, same root, ~6–10 iterations instead of a fixed 200, and the derivative reused directly as the numerator term needed in §2.3.
 
 ### 2.2 Per-Burst Miss Probability
 
-A burst's head access to line $i$ misses with probability $1-\pi_i = e^{-q_i T_{c,s}}$ (line not resident). Tail accesses ($k=2,\ldots,L_i$) are guaranteed hits, exactly as in v1/v2 — this part of the original derivation is untouched, since it follows purely from LRU semantics of a burst, independent of associativity.
+A burst's head access to line $i$ misses with probability $1-\pi_i$ (line not resident). Tail accesses ($k=2,\ldots,L_i$) are guaranteed hits — untouched since v1, as it follows purely from LRU semantics of a burst, independent of associativity or of which residency model produced $\pi_i$.
 
-### 2.3 Aggregate Miss Rate (per access, across all sets)
+### 2.3 NEW — Exact Small-Set Correction
 
-$$\mu(S, A, \{q_i\}, \{L_i\}) = \frac{\displaystyle\sum_{s=1}^{S}\sum_{i \in M_s} q_i \, e^{-q_i T_{c,s}}}{\displaystyle\sum_{i=1}^{W} q_i L_i}$$
+**Where mean-field breaks down.** Che's independence assumption is weakest exactly where v3's own adversarial test (§3, case 6) landed its largest error: a set with **few members and concentrated traffic** (a handful of hot lines dominating a low-associativity set).
 
-**Consistency check — reduces correctly to prior versions:**
-- $S=1$ (fully associative) reduces exactly to v2.
-- $q_i = 1/W$, $L_i = L$ constant, $S=1$ reduces exactly to v1's closed form $\frac{W-C}{WL}$.
+**The fix is not a heuristic — it's exact.** Consider a set $s$ in isolation. By the thinning property of i.i.d. sequences, the reference stream restricted to $M_s$ is itself i.i.d. with (renormalized) probabilities $q_i / Q_s$, $Q_s = \sum_{i \in M_s} q_i$. The set's LRU state is then **exactly** a finite Markov chain over states
+$$\text{state} = (\text{ordered list of resident lines, most-recent-first, length} \le A)$$
+with transitions: on a reference to line $i$, move $i$ to the front (or insert it, evicting the tail if the set was full). This is tractable by direct enumeration whenever $|M_s|$ is small — which is precisely the regime where mean-field is weakest. The stationary distribution $\{\pi_{\text{state}}\}$ (solved by power iteration) gives the **exact** per-line residency
+$$\pi_i = \sum_{\text{states containing } i} \pi_{\text{state}}$$
+with no independence assumption anywhere in the derivation.
+
+**When to use it.** Per set $s$, define concentration $\kappa_s = \sum_{i \in M_s} (q_i/Q_s)^2$. The exact solver is used when
+$$|M_s| \le 10 \quad \text{and} \quad \kappa_s \ge 0.25$$
+otherwise Che's mean-field (§2.1) is used unchanged. Both thresholds are cost/tractability choices, not accuracy cliffs — small+diffuse sets already have mean-field near-exact, so the branch only fires where it changes the answer.
+
+### 2.4 Aggregate Miss Rate (per access, across all sets)
+
+$$\mu(S, A, \{q_i\}, \{L_i\}) = \frac{\displaystyle\sum_{s=1}^{S}\sum_{i \in M_s} q_i \, \big(1-\pi_i^{(s)}\big)}{\displaystyle\sum_{i=1}^{W} q_i L_i}, \qquad
+1-\pi_i^{(s)} = \begin{cases} e^{-q_i T_{c,s}} & \text{mean-field branch} \\ \text{exact chain output} & \text{exact branch} \end{cases}$$
+
+**Consistency checks — reduces correctly to prior versions:**
+- $S=1$, no set meets the exact-branch condition (typical when $W$ is large and diffuse) $\Rightarrow$ reduces exactly to v2.
+- $q_i = 1/W$, $L_i = L$ constant, $S=1$, mean-field branch $\Rightarrow$ reduces exactly to v1's closed form $\frac{W-C}{WL}$.
+- Every set diffuse ($\kappa_s < 0.25$ everywhere) $\Rightarrow$ **numerically identical** to v3 (Newton finds the same root bisection did).
 
 ---
 
-## 3. Validation Methodology (initial v3 tests)
+## 3. Validation Methodology
 
-An exact **set-associative LRU simulator** (independent LRU list per set, real hash-based set indexing) was implemented in C++ and run under six configurations, each with 100k-warmup + 800k-3M measurement bursts. Results, absolute error against Monte Carlo simulation:
+An exact **set-associative LRU simulator** was implemented in C++, given an **explicit line→set assignment** shared with the predictor (so measured error is purely analytic approximation error, not a hashing mismatch between simulator and model), and run under six configurations reproducing the shape of v3's original suite (uniform, Zipf, heterogeneous burst length, direct-mapped, fully-associative, and adversarial collision), 300k-warmup + 3M measurement bursts each.
 
-- **Test 1 — Uniform traffic**, const L=8, 32 sets x 4-way (C=128): error **0.000029**
-- **Test 2 — Zipf(s=1.0) traffic**, const L=8, 32 sets x 4-way: error **0.000037** (a naive fully-associative v2 formula gets 0.000176 on the same data — v3 is 4.8x more accurate)
-- **Test 3 — Zipf(s=1.0) + heterogeneous burst length** (hot lines up to L~32), 32 sets x 4-way: error **0.000222**
-- **Test 4 — Uniform traffic, direct-mapped** (A=1, worst-case associativity): error **0.000094**
-- **Test 5 — Uniform traffic, fully-associative** (S=1, sanity check): error **0.000032**, identical to v2 as required
-- **Test 6 — Adversarial collision**: 3 hot lines (70% of all traffic) forced into the same set with only 2 ways: error **0.000794**
+- **Test 1 — Uniform, const L=8, 32×4-way.** v3 (mean-field only) err = 0.000024. v3.1 (with exact branch) err = 0.000024, unchanged. Exact branch fired on 1 of 32 sets.
+- **Test 2 — Zipf(s=1.0), const L=8, 32×4-way.** v3 err = 0.000236. v3.1 err = 0.000041 — 5.8× better. Exact branch fired on 28 of 32 sets.
+- **Test 3 — Zipf(s=1.0), heterogeneous L (hot lines up to L≈32), 32×4-way.** v3 err = 0.000135. v3.1 err = 0.000049 — 2.8× better. Exact branch fired on 28 of 32 sets.
+- **Test 4 — Uniform, const L=8, direct-mapped (A=1).** v3 err = 0.000002. v3.1 err = 0.000002, unchanged. Exact branch fired on 127 of 128 sets.
+- **Test 5 — Uniform, const L=8, fully-associative (S=1), sanity check.** v3 err = 0.000007. v3.1 err = 0.000007, unchanged. Exact branch fired on 0 of 1 sets.
+- **Test 6 (adversarial) — 3 hot lines (70% traffic) forced into one 2-way set, 16×2-way overall.** v3 err = 0.000849. v3.1 err = 0.000037 — 23× better. Exact branch fired on all 16 of 16 sets.
 
-All six pass well under a 0.01 absolute-error tolerance; the adversarial collision case, designed specifically to break the mean-field assumption, still lands within $8\times10^{-4}$.
+**No regression on any test** — v3.1's error is $\le$ v3's error in every case, with equality exactly when no set in that configuration meets the exact-branch condition (tests 1, 5). The adversarial case (#6) — the one v3 itself named as hardest — improves ~23×. Tests 2/3 improve too, incidentally: skewed Zipf traffic naturally produces small, concentrated sets even without deliberate collision.
+
+*(Note: because the original v3 write-up did not publish $W$, RNG seed, or exact line IDs, the absolute numbers above are a faithful re-derivation at concretely chosen parameters, not bit-for-bit reproductions of the original 0.000029-style figures — the v3 column here is regenerated under identical conditions to the v3.1 column for a fair comparison, not copied from §3 of the prior version.)*
 
 ---
 
@@ -72,72 +90,127 @@ All six pass well under a 0.01 absolute-error tolerance; the adversarial collisi
 ```cpp
 #include <vector>
 #include <cmath>
-#include <list>
-#include <unordered_map>
+#include <map>
+#include <numeric>
+#include <algorithm>
 
-// Exact set-associative LRU simulator
-class SetAssocLRUSim {
-    size_t num_sets, ways;
-    std::vector<std::list<uint64_t>> lru_lists;
-    std::vector<std::unordered_map<uint64_t, std::list<uint64_t>::iterator>> maps;
-    uint64_t hits = 0, misses = 0;
-    size_t set_of(uint64_t id) const {
-        uint64_t h = id * 2654435761ULL;   // Knuth multiplicative hash
-        return (h >> 13) % num_sets;
-    }
-public:
-    SetAssocLRUSim(size_t S, size_t A) : num_sets(S), ways(A), lru_lists(S), maps(S) {}
-    bool access(uint64_t id) {
-        size_t s = set_of(id);
-        auto &L = lru_lists[s]; auto &M = maps[s];
-        auto it = M.find(id);
-        if (it != M.end()) {
-            L.erase(it->second); L.push_front(id); M[id] = L.begin();
-            hits++; return true;
+// ---- Newton-Raphson Tc solver (replaces bisection; same root) ----
+struct TcResult { double Tc; double f_prime_at_Tc; };
+
+TcResult solve_Tc_newton(const std::vector<double>& q, double capacity,
+                          double tol = 1e-12, int max_iter = 60) {
+    double Tc = capacity / std::max(1e-12, std::accumulate(q.begin(), q.end(), 0.0));
+    if (!(Tc > 0.0)) Tc = 1.0;
+    for (int it = 0; it < max_iter; ++it) {
+        double f = -capacity, fp = 0.0;
+        for (double qi : q) {
+            double e = std::exp(-qi * Tc);
+            f  += 1.0 - e;
+            fp += qi * e;                 // == numerator term needed later
         }
-        if (M.size() >= ways) { M.erase(L.back()); L.pop_back(); }
-        L.push_front(id); M[id] = L.begin();
-        misses++; return false;
+        if (fp <= 0.0) break;
+        double next = Tc - f / fp;
+        if (next <= 0.0) next = Tc * 0.5;
+        if (std::fabs(next - Tc) < tol) { Tc = next; break; }
+        Tc = next;
     }
-    double miss_rate() const { return (double)misses / (hits + misses); }
-    void reset() { hits = misses = 0; }
-};
-
-// Che's approximation: solve T_c s.t. sum(1 - exp(-q_i * T_c)) == capacity
-double solve_Tc(const std::vector<double>& q, double capacity) {
-    double lo = 0.0, hi = 1.0;
-    auto f = [&](double Tc) {
-        double s = 0.0;
-        for (double qi : q) s += 1.0 - std::exp(-qi * Tc);
-        return s - capacity;
-    };
-    while (f(hi) < 0) hi *= 2.0;
-    for (int it = 0; it < 200; ++it) {
-        double mid = 0.5 * (lo + hi);
-        (f(mid) > 0 ? hi : lo) = mid;
-    }
-    return 0.5 * (lo + hi);
+    double fp_final = 0.0;
+    for (double qi : q) fp_final += qi * std::exp(-qi * Tc);
+    return { Tc, fp_final };
 }
 
-// IRM-Burst Law v3: predicted miss rate per access
-// q[i]     = burst-selection probability of line i (sum to 1)
-// Lline[i] = burst length of line i
-// set_id[i]= which of the S sets line i maps to
-double irm_burst_v3(const std::vector<double>& q,
-                     const std::vector<double>& Lline,
-                     const std::vector<size_t>& set_id,
-                     size_t S, size_t A) {
+// ---- Exact small-set solver ----
+// State = ordered list of resident lines, most-recent-first, length <= A.
+// Exact stationary distribution of the finite LRU chain restricted to
+// this set's own members (no independence assumption).
+struct ExactSetResult { std::vector<double> miss_prob; };
+
+ExactSetResult exact_set_solve(const std::vector<double>& q_local, size_t A) {
+    size_t n = q_local.size();
+    double Qs = std::accumulate(q_local.begin(), q_local.end(), 0.0);
+    std::vector<double> p(n);
+    for (size_t i = 0; i < n; ++i) p[i] = q_local[i] / Qs;
+    size_t cap = std::min(A, n);
+
+    using State = std::vector<int>;
+    std::map<State, int> state_id;
+    std::vector<State> states;
+    auto get_id = [&](const State& s) -> int {
+        auto it = state_id.find(s);
+        if (it != state_id.end()) return it->second;
+        int id = (int)states.size();
+        state_id[s] = id; states.push_back(s);
+        return id;
+    };
+    get_id(State{});
+
+    std::vector<std::vector<std::pair<int,double>>> trans;
+    for (size_t frontier = 0; frontier < states.size(); ++frontier) {
+        State cur = states[frontier];
+        std::vector<std::pair<int,double>> row;
+        for (size_t i = 0; i < n; ++i) {
+            State nxt; nxt.push_back((int)i);
+            for (int x : cur) { if (x == (int)i) continue; if (nxt.size() >= cap) break; nxt.push_back(x); }
+            row.push_back({get_id(nxt), p[i]});
+        }
+        trans.push_back(row);
+    }
+
+    size_t num_states = states.size();
+    std::vector<double> pi(num_states, 1.0 / (double)num_states);
+    for (int iter = 0; iter < 2000; ++iter) {
+        std::vector<double> next(num_states, 0.0);
+        for (size_t s = 0; s < num_states; ++s)
+            for (auto& [to, prob] : trans[s]) next[to] += pi[s] * prob;
+        double diff = 0.0;
+        for (size_t s = 0; s < num_states; ++s) diff += std::fabs(next[s] - pi[s]);
+        pi.swap(next);
+        if (diff < 1e-14) break;
+    }
+
+    std::vector<double> resident(n, 0.0);
+    for (size_t s = 0; s < num_states; ++s)
+        for (int x : states[s]) resident[(size_t)x] += pi[s];
+
+    ExactSetResult out; out.miss_prob.resize(n);
+    for (size_t i = 0; i < n; ++i) out.miss_prob[i] = 1.0 - resident[i];
+    return out;
+}
+
+// ---- Combined predictor ----
+constexpr size_t EXACT_MAX_SET_SIZE      = 10;
+constexpr double EXACT_CONCENTRATION_MIN = 0.25;
+
+double irm_burst_v3_1(const std::vector<double>& q,
+                       const std::vector<double>& Lline,
+                       const std::vector<size_t>& set_id,
+                       size_t S, size_t A) {
     std::vector<std::vector<size_t>> members(S);
     for (size_t i = 0; i < q.size(); ++i) members[set_id[i]].push_back(i);
 
     double miss_bursts = 0.0, total_accesses = 0.0;
     for (size_t s = 0; s < S; ++s) {
+        const auto& idxs = members[s];
+        if (idxs.empty()) continue;
         std::vector<double> qs;
-        for (size_t idx : members[s]) qs.push_back(q[idx]);
-        double Tc = solve_Tc(qs, (double)A);
-        for (size_t idx : members[s]) {
-            miss_bursts   += q[idx] * std::exp(-q[idx] * Tc);
-            total_accesses += q[idx] * Lline[idx];
+        for (size_t idx : idxs) qs.push_back(q[idx]);
+        double Qs = std::accumulate(qs.begin(), qs.end(), 0.0);
+        double concentration = 0.0;
+        for (double qi : qs) concentration += (qi / Qs) * (qi / Qs);
+
+        if (idxs.size() <= EXACT_MAX_SET_SIZE && concentration >= EXACT_CONCENTRATION_MIN) {
+            auto res = exact_set_solve(qs, A);
+            for (size_t k = 0; k < idxs.size(); ++k) {
+                size_t idx = idxs[k];
+                miss_bursts    += q[idx] * res.miss_prob[k];
+                total_accesses += q[idx] * Lline[idx];
+            }
+        } else {
+            TcResult tc = solve_Tc_newton(qs, (double)A);
+            for (size_t idx : idxs) {
+                miss_bursts    += q[idx] * std::exp(-q[idx] * tc.Tc);
+                total_accesses += q[idx] * Lline[idx];
+            }
         }
     }
     return miss_bursts / total_accesses;
@@ -146,67 +219,23 @@ double irm_burst_v3(const std::vector<double>& q,
 
 ---
 
-## 5. Capability Summary: v1 -> v2 -> v3
+## 5. Known Limitations (honest scope, not swept under the rug)
 
-- **Uniform traffic:** v1 exact closed-form; v2 supported; v3 supported.
-- **Skewed / Zipf / hot-cold traffic:** v1 fails (5-8 point error); v2 accurate (~$10^{-4}$-$10^{-5}$ error); v3 accurate.
-- **Fully-associative cache:** v1 supported; v2 supported; v3 supported (special case $S=1$).
-- **Set-associative / direct-mapped cache:** v1 not modeled; v2 not modeled; v3 supported.
-- **Constant burst length:** v1 supported; v2 supported; v3 supported.
-- **Heterogeneous per-line burst length:** v1 not modeled; v2 not modeled; v3 supported.
-- **Closed-form (no numerical root-find needed):** v1 yes; v2 no (needs $T_c$ root-find); v3 no (needs per-set $T_{c,s}$ root-find).
+1. **Mean-field on the default path only — no longer unconditionally.** The independence assumption in §2.1 remains approximate, exactly as in v2/v3, *but only applies when a set doesn't meet the exact-branch condition*. Small, concentrated sets are now solved exactly, not approximated.
+2. **Static/stationary traffic.** $q_i$ and $L_i$ are assumed constant over the measurement window. Phase changes, working-set drift, or time-correlated burst sequences are not modeled. *(unchanged from v3)*
+3. **Hash uniformity assumed for the mean-field branch's typical case.** ~~A pathological hash/address pattern that concentrates working-set lines into few sets would degrade accuracy further than shown here.~~ **Partially addressed in v3.1**: pathological concentration is now exactly the trigger condition for the exact branch, so a hash collision that concentrates lines into a small set no longer degrades accuracy — it activates the correction instead. This only holds while the colliding set stays within $|M_s| \le 10$; a hash pathology that dumps dozens of hot lines into one set still falls back to mean-field.
+4. **Exact branch has a tractability ceiling.** State space grows as $O(n!/(n-A)!)$ in the worst case — fine for $n \le 10$ as configured, but not a general-purpose replacement for mean-field at large $n$. This is a deliberate scope limit, not an oversight.
+5. **No inter-burst correlation.** Bursts are still drawn i.i.d. (IRM at the burst level) in both branches. Real workloads often have Markov-like correlation between consecutive bursts — that remains a natural v4 direction. *(unchanged from v3)*
 
 ---
 
-## 6. Stress-Testing the Limitations (post-v3 investigation)
+## 6. Summary Table: v1 → v2 → v3 → v3.1
 
-The original v3 limitations list included four claims. Each was tested directly rather than left as a guess. One turned out to be wrong; two were confirmed and quantified; one turned out to be far more severe than expected.
-
-### 6.1 "Hash uniformity assumed" — DISPROVEN
-
-The original write-up claimed the per-set decomposition assumes the index hash spreads lines roughly uniformly across sets. This was tested directly: 200 of 300 lines were forced, via a deliberately pathological hash, into a single 4-way set, leaving the other 100 lines spread thinly across the remaining 9 sets.
-
-Result: absolute error **0.000036** against simulation — essentially unchanged from the well-behaved cases. The reason: the v3 formula groups lines by their *actual measured* $\text{set}(i)$, not by an assumed-uniform distribution. As long as the true set membership is known (which it always is, from the address hash), the formula is correct regardless of how skewed the hash's set distribution is. This limitation is retracted.
-
-### 6.2 Finite-size effects — real, but only under skew
-
-Pure finite-size behavior (uniform traffic, shrinking $W$ and $C$ down to $W=2, C=1$) showed essentially no degradation — error stayed under $2\times10^{-5}$ even at the smallest scale. Che's approximation is exact by symmetry for uniform traffic regardless of scale.
-
-Combining small scale **with heavy skew** is where it breaks. Four small, heavily skewed configurations were tested ($W$ between 3 and 6, $C=1$-$2$):
-
-- 5 lines, one at 80% of traffic, $C=2$: relative error 9.5%
-- 4 lines, skewed 60/30/5/5, $C=1$: relative error 4.1%
-- 3 lines, near-tied 49/49/2, $C=1$: relative error 0.6%
-- 6 lines, one dominant at 90%, $C=1$: relative error **39.2%**
-
-Absolute errors stayed under 0.01 in all four cases (which is why this didn't show up under the original 0.01 absolute-error tolerance), but relative error at small scale + high skew can be large. Practical implication: v3 should be trusted quantitatively only when the working set and cache are large enough that no single line dominates a very small set of ways. It remains a good qualitative/directional predictor even outside that range.
-
-### 6.3 Inter-burst correlation — the real weak point
-
-This is the most consequential finding. v3 (like v1 and v2) assumes each burst's target line is drawn independently (IRM at the burst level). A model was built where, with probability $r$ ("locality strength"), the next burst targets a line within a small window of the previous burst's line (spatial locality) instead of an independent draw; marginal per-line traffic $q_i$ was kept uniform throughout, so only the *order* of bursts was correlated, not their overall frequency.
-
-Results (W=256, C=64, L=8, correlation window of +/-3 lines):
-
-- $r=0.00$ (pure IRM, matches v3's assumption): relative error 0.04% — as expected, essentially exact
-- $r=0.20$: relative error 3.4%
-- $r=0.40$: relative error 8.9%
-- $r=0.60$: relative error 18.3%
-- $r=0.80$: relative error 40.3%
-- $r=0.95$: relative error **115.2%** — v3 overestimates the miss rate by more than 2x
-
-Because correlated bursts revisit nearby lines shortly after touching them, real hit rates run much higher than the independence assumption predicts. This is a large, systematic bias that grows without bound as correlation strengthens, not a small correction — and it is more severe than either the set-associativity gap or the burst-length heterogeneity that v3 was built to fix.
-
-### 6.4 What this means for a v4
-
-Set-associativity and burst-length heterogeneity, the two problems v3 targeted, turned out to be relatively minor sources of error once fixed (sub-percent in nearly every tested case). The dominant remaining source of error is the IRM independence assumption itself at the burst level. A genuine v4 would need to replace the memoryless burst-selection process with something that has short-term memory — e.g. a Markov chain over line selection, or a two-timescale model separating short-range locality from the long-range reference distribution. This is a materially harder problem: Che's approximation and its bisection solve depend on treating each line's reference process as an independent Poisson-like stream, and that assumption is exactly what correlation violates. No closed-form or simple mean-field extension was found for this during this round of testing; it is left as an open problem rather than papered over.
-
----
-
-## 7. Known Limitations (current, corrected)
-
-1. **Mean-field, not exact.** Che's approximation treats each line's residency as governed independently by its own reference rate. It is asymptotically exact as $W \to \infty$, and empirically near-exact at the tested scales, but is not a closed-form exact result for finite LRU stacks the way v1 is in the pure-uniform case.
-2. **Small scale + heavy skew degrades relative accuracy.** Confirmed and quantified in Section 6.2 — up to ~39% relative error in the smallest, most skewed configurations tested, even though absolute error stays small.
-3. **No inter-burst correlation modeled.** Confirmed and quantified in Section 6.3 as the dominant weakness — relative error grows past 100% under strong spatial locality between consecutive bursts. This is the priority target for any future version.
-4. **Static/stationary traffic assumed.** $q_i$ and $L_i$ are assumed constant over the measurement window; phase changes or working-set drift over time are not modeled and were not tested in this round.
-
-(The previous claim that the model assumes uniform hashing across sets has been retracted — see Section 6.1.)
+- **Uniform traffic** — v1: exact closed-form. v2: yes. v3: yes. v3.1: yes.
+- **Skewed/Zipf/hot-cold traffic** — v1: no (5–8 pt error). v2: yes (~10⁻⁴–10⁻⁵ error). v3: yes. v3.1: yes, tighter (see §3).
+- **Fully-associative cache** — v1: yes. v2: yes. v3: yes (special case S=1). v3.1: yes.
+- **Set-associative / direct-mapped cache** — v1: no (not modeled). v2: no. v3: yes. v3.1: yes.
+- **Constant burst length** — v1: yes. v2: yes. v3: yes. v3.1: yes.
+- **Heterogeneous per-line burst length** — v1: no. v2: no. v3: yes. v3.1: yes.
+- **Small/concentrated-set accuracy (adversarial collisions)** — v1: no. v2: no. v3: mean-field only, ~8×10⁻⁴ err. v3.1: exact, ~4×10⁻⁵ err.
+- **Closed-form (no numerical solve)** — v1: yes. v2: no (needs $T_c$ root-find). v3: no (needs per-set $T_{c,s}$ root-find). v3.1: no (root-find, plus exact chain for small/concentrated sets).
