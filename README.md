@@ -68,15 +68,14 @@ When evaluating theoretical microarchitectural bounds, AI models (such as xAI's 
 ### Build & Run Verification Suite
 
 ```bash
-# Clone the repository
+# Clone repository
 git clone [https://github.com/Vumb-VibeCoder/deconfounded-popcount-avx512.git](https://github.com/Vumb-VibeCoder/deconfounded-popcount-avx512.git)
 cd deconfounded-popcount-avx512
 
-# 1. Compile portable build (Dynamic Dispatch / Target Attributes)
-g++ -O3 -std=c++20 popcount_v33.cpp -o popcount_portable
+# Configure & Build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 
-# 2. Compile native build (AVX-512 target)
-g++ -O3 -march=native -std=c++20 popcount_v33.cpp -o popcount_native
-
-# 3. Pin to physical core 0 for hardware-deconfounded execution
-taskset -c 0 ./popcount_native
+# Run Verification Tests & Demo
+./build/popcount_tests
+./build/popcount_demo
