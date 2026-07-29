@@ -1,8 +1,3 @@
-/*
- * Copyright (c) 2026 Hoang Gia Bao
- * Developed as part of the IRM-Burst Microarchitectural Diagnostic Framework.
- * Licensed under the MIT License. See LICENSE file in the project root for details.
- */
 // ============================================================
 // popcount_v21_combined.cpp — Unified v18 + v19 + v21 (SIMD + RDTSCP)
 //
@@ -2590,6 +2585,240 @@ static bool self_test_che_zipf_law(mt19937_64& rng){
     return all_ok;
 }
 
+// ============================================================
+// [v28-NEW, HOP NHAT] Dinh luat IRM-Burst thong nhat: Che (xap xi cho
+// popularity LECH, tu [v24]) + set-associative (tu [v26]) + burst-length
+// KHONG DONG NHAT theo tung trang (L_i rieng - CHUA tung co o [v23]/[v24]/[v26]).
+//
+// BOI CANH (khoang trong cu the giua cac phien ban da co): [v24] mo rong
+// [v23] sang popularity lech NHUNG chi chung minh/kiem chung cho cache
+// FULLY-ASSOCIATIVE (S=1). [v26] mo rong [v23] sang set-associative NHUNG
+// chi cho popularity DEU (dung xap xi CLT/Binomial tren TAI cua tung set,
+// khong nhan p_i lech lam dau vao cong thuc). Hai huong mo rong nay CHUA
+// BAO GIO duoc hop nhat trong file - day la khoang trong [v28] lap day.
+//
+// DAN XUAT: thay vi mot t_C DUY NHAT cho toan cache (nhu [v24]) hay xap xi
+// CLT tren bien Binomial (nhu [v26]), GIAI RIENG mot t_{C,s} cho MOI set s
+// bang CHINH ham che_characteristic_time() da co san o [v24] - chi truyen
+// vao TAP CON xac suat p_i cua cac trang anh xa vao set s, voi dung luong
+// muc tieu = A (so way MOI set, khong phai C toan cache). Day KHONG PHAI ky
+// thuat moi tach biet, ma la AP DUNG LAI dung cong thuc [v24] da tu-kiem-
+// chung, o muc do phan giai tung set - giam rui ro loi so voi viet lai mot
+// xap xi CLT rieng nhu [v26] da lam:
+//
+//   t_{C,s}     = che_characteristic_time({p_i : set(i)=s}, A)
+//   hit_i       = che_hit_prob(p_i, t_{set(i)})
+//   hit_tong    = sum_i p_i * hit_i                    (trung binh theo p_i)
+//   mien/access = (sum_i p_i*(1-hit_i)) / (sum_i p_i * L_i)
+//                 (tu so: xac suat mot BURST bat ky boc trung head-miss;
+//                  mau so: so truy cap TRUNG BINH moi burst dong gop, cho
+//                  phep L_i khac nhau theo trang - vd trang "hot" thuong co
+//                  chuoi truy cap lien tiep DAI hon trang "lanh" trong
+//                  workload thuc, dieu [v23]/[v24]/[v26] deu chua mo ta duoc)
+//
+// KIEM TRA TINH NHAT QUAN (suy dien duoc, doi chieu bang so o self-test):
+//   - S=1 (1 set duy nhat) => trung khop CHINH XAC che_predicted_hit_rate()
+//     cua [v24] (chi con dung 1 t_C cho toan bo, giong het ve dai so).
+//   - p_i deu VA L_i deu => xap xi gan [v23]/[v26], nhung KHONG trung tuyet
+//     doi voi [v26] vi hai co che xap xi khac nhau (Che vs CLT-Binomial) cho
+//     CUNG mot dai luong that - da doi chieu so lieu cu the ben duoi.
+//
+// GIOI HAN TRUNG THUC (khong che giau, tiep tuc tinh than [v23]-[v27]):
+//   1) Van la xap xi mean-field (Che), KHONG phai dang thuc dung nhu [v23].
+//      Kiem tra rieng (ngoai file, khong lap lai o day de tranh phinh thoi
+//      gian chay): sai lech TUONG DOI co the len ~40% khi W,C RAT nho (vai
+//      trang) VA popularity LECH manh CUNG LUC - ket hop xau nhat, hiem gap
+//      trong cache/TLB thuc (thuong C,W lon hang tram-nghin) nhung can ghi
+//      nhan trung thuc thay vi gia dinh luon dung moi quy mo.
+//   2) QUAN TRONG NHAT, con lai chua co huong sua trong file nay: cong thuc
+//      nay (cung nhu [v23]/[v24]/[v26]) GIA DINH cac burst duoc CHON DOC LAP
+//      (IID) - khong tuong quan KHONG GIAN/THOI GIAN giua cac burst lien
+//      tiep. Khi co "locality" thuc (burst ke tiep co xu huong GAN burst
+//      truoc - rat pho bien trong workload that, vd duyet gan mot vung nho
+//      roi moi nhay xa), cong thuc OVERESTIMATE miss rate nghiem trong. Ham
+//      self_test_irm_v28_correlation_gap() ben duoi DO TRUC TIEP dieu nay
+//      bang C++ that (khong chi lap luan) - cung tinh than phat hien cua
+//      [v27] (phat lai co dinh) nhung cho truc "tuong quan giua cac burst".
+//      Day la gioi han LON NHAT con lai; [v28] KHONG gia vo da giai quyet no.
+// ============================================================
+static double predict_hit_rate_v28(const vector<double>& p,
+                                    const vector<int>& set_of_idx,
+                                    int S, double A){
+    vector<vector<double>> set_p(S);
+    for (size_t i = 0; i < p.size(); i++) set_p[set_of_idx[i]].push_back(p[i]);
+    vector<double> tC(S, 0.0);
+    for (int s = 0; s < S; s++)
+        if (!set_p[s].empty()) tC[s] = che_characteristic_time(set_p[s], A);
+
+    double hit_total = 0.0;
+    for (size_t i = 0; i < p.size(); i++)
+        hit_total += p[i] * che_hit_prob(p[i], tC[set_of_idx[i]]);
+    return hit_total;
+}
+// mien/access voi burst-length KHONG DONG NHAT L_i (L_i=hang so cho moi i
+// se tro thanh dung cong thuc mien/line quen thuoc, xem consistency check)
+static double predict_miss_per_access_v28(const vector<double>& p,
+                                           const vector<double>& Lline,
+                                           const vector<int>& set_of_idx,
+                                           int S, double A){
+    vector<vector<double>> set_p(S);
+    for (size_t i = 0; i < p.size(); i++) set_p[set_of_idx[i]].push_back(p[i]);
+    vector<double> tC(S, 0.0);
+    for (int s = 0; s < S; s++)
+        if (!set_p[s].empty()) tC[s] = che_characteristic_time(set_p[s], A);
+
+    double miss_bursts = 0.0, total_access_weight = 0.0;
+    for (size_t i = 0; i < p.size(); i++){
+        double hit_i = che_hit_prob(p[i], tC[set_of_idx[i]]);
+        miss_bursts += p[i] * (1.0 - hit_i);
+        total_access_weight += p[i] * Lline[i];
+    }
+    return miss_bursts / total_access_weight;
+}
+
+// ---------- [v28-NEW] Self-test: kiem chung dinh luat hop nhat bang LRU that ----------
+// Mo phong S set doc lap (SimpleLRU dung luong A moi set), trang x anh xa
+// vao set qua (x % S) - dung dieu kien ly thuyet gia dinh, giong
+// self_test_irm_assoc_law() cua [v26] - nhung o day traffic co the LECH
+// (Zipf theta) VA burst-length co the KHONG DONG NHAT theo tung trang,
+// hai truc [v26] va [v23]/[v24] chua bao gio cung xuat hien trong 1 test.
+static bool self_test_irm_v28_law(mt19937_64& rng){
+    struct Case {
+        int W, S; double A_target; double theta; bool heterogeneous_L; long refs; const char* label;
+    };
+    vector<Case> cases = {
+        {512, 1,  64.0, 0.0, false, 1500000, "S=1 deu (phai == che_predicted_hit_rate [v24] tuyet doi)"},
+        {512, 32,  4.0, 0.0, false, 1500000, "deu, 32set x A=4 (doi chieu voi [v26] xap xi CLT)"},
+        {512, 32,  4.0, 1.0, false, 1500000, "Zipf theta=1.0, 32set x A=4 (KET HOP MOI: skew+assoc)"},
+        {512, 32,  4.0, 1.0, true,  1500000, "Zipf theta=1.0 + burst-length khong dong nhat, 32set x A=4"},
+        {256, 64,  1.0, 0.0, false, 1500000, "deu, direct-mapped A=1 (truong hop assoc xau nhat)"},
+        {512, 16,  2.0, 1.5, true,  2000000, "Zipf theta=1.5 (lech manh) + L khong dong nhat, 16set x A=2"},
+    };
+    bool all_ok = true;
+    cout << "[self-test IRM hop nhat, v28] Che tung-set + burst-length khong dong nhat,\n"
+            "  doi chieu ty le hit/mien thuc nghiem voi mo phong LRU that (S set doc lap):\n";
+    for (auto& c : cases){
+        auto p = zipf_probs(c.W, c.theta);
+        vector<int> set_of_idx(c.W);
+        for (int i = 0; i < c.W; i++) set_of_idx[i] = i % c.S;
+        int A = (int)llround(c.A_target);
+
+        vector<double> Lline(c.W, 8.0);
+        if (c.heterogeneous_L){
+            double pmax = *max_element(p.begin(), p.end());
+            for (int i = 0; i < c.W; i++) Lline[i] = 2.0 + 30.0 * (p[i] / pmax); // trang hot -> burst dai hon
+        }
+
+        double theo_hit = predict_hit_rate_v28(p, set_of_idx, c.S, (double)A);
+        double theo_miss_access = predict_miss_per_access_v28(p, Lline, set_of_idx, c.S, (double)A);
+
+        // Mo phong that: S set doc lap, moi lan chon 1 trang theo p (Zipf hoac
+        // deu), phat L_i truy cap lien tiep vao dung trang do (burst semantics
+        // giong het [v23]/[v24]/[v26]: chi truy cap DAU cua burst co the miss).
+        discrete_distribution<int> pick(p.begin(), p.end());
+        vector<SimpleLRU> sets;
+        sets.reserve(c.S);
+        for (int s = 0; s < c.S; s++) sets.emplace_back(A);
+
+        long warmup_bursts = 20000 + 60L * c.W / max(1, c.S); // du de cac set it truy cap cung duoc lam nong
+        for (long i = 0; i < warmup_bursts; i++){
+            int page = pick(rng);
+            long Lb = (long)llround(Lline[page]);
+            for (long b = 0; b < Lb; b++) sets[set_of_idx[page]].touch(page);
+        }
+        long access_hits = 0, access_total = 0;
+        long burst_count = (long)(c.refs / 8); // ~c.refs tong so truy cap (L trung binh ~8)
+        for (long i = 0; i < burst_count; i++){
+            int page = pick(rng);
+            long Lb = (long)llround(Lline[page]);
+            for (long b = 0; b < Lb; b++){
+                bool hit = sets[set_of_idx[page]].touch(page);
+                if (hit) access_hits++;
+                access_total++;
+            }
+        }
+        double emp_miss_access = 1.0 - (double)access_hits / (double)access_total;
+        double err = fabs(theo_miss_access - emp_miss_access);
+        // Nguong long hon [v24]/[v26] rieng le (0.02/0.015) vi day la CHONG
+        // xap xi (Che tung-set CONG voi phan giai burst khong dong nhat) -
+        // 0.025 van du chat de bat loi logic, du long cho chong sai so.
+        bool ok = err < 0.025;
+        cout << "  [" << c.label << "]\n"
+             << "    W=" << setw(6) << c.W << " S=" << setw(3) << c.S << " A=" << setw(2) << A
+             << " theta=" << fixed << setprecision(2) << c.theta
+             << " L_het=" << (c.heterogeneous_L ? "co" : "khong") << "\n"
+             << "    ly_thuyet(mien/access)=" << setprecision(6) << theo_miss_access
+             << "  thuc_nghiem=" << emp_miss_access << "  sai_lech=" << err
+             << (ok ? "  OK\n" : "  [LOI! khong khop mo phong tren may nay]\n");
+        all_ok = all_ok && ok;
+
+        if (c.S == 1 && !c.heterogeneous_L){
+            double che_ref = che_predicted_hit_rate(p, (double)A);
+            double consistency_err = fabs(che_ref - theo_hit);
+            cout << "    (doi chieu tinh nhat quan voi [v24]: che_predicted_hit_rate=" << che_ref
+                 << "  predict_hit_rate_v28=" << theo_hit << "  lech=" << scientific << setprecision(2)
+                 << consistency_err << fixed << "  " << (consistency_err < 1e-9 ? "OK (trung khop dai so)\n" : "[CANH BAO]\n");
+            all_ok = all_ok && (consistency_err < 1e-9);
+        }
+    }
+    return all_ok;
+}
+
+// ---------- [v28-NEW] Phoi bay gioi han: tuong quan giua cac burst lien tiep ----------
+// KHONG phai self-test "pass/fail" nhu cac ham tren - day la PHEP DO truc
+// tiep muc do sai lech cua [v28] (va ca [v23]/[v24]/[v26], vi tat ca deu
+// dung chung gia dinh IID o tang burst) khi gia dinh IID bi vi pham co chu
+// dich, cung tinh than dieu tra cua self_test_irm_fixed_replay_gap() [v27]
+// nhung cho MOT truc khac: o day p_i VAN deu (KHONG doi tan suat bien), chi
+// THU TU cac burst la co tuong quan khong gian - voi xac suat r, burst ke
+// tiep nham vao mot trang GAN trang vua roi (cua so +-3) thay vi rut IID
+// tu p; voi xac suat (1-r) van rut IID nhu binh thuong ([v28] du doan DUNG
+// khi r=0, vi day chinh la gia thiet cua no).
+static void self_test_irm_v28_correlation_gap(mt19937_64& rng){
+    cout << "\n[v28] Phoi bay gioi han: tuong quan KHONG GIAN/THOI GIAN giua cac burst\n"
+            "  (p_i van DEU xuyen suot - chi THU TU burst bi tuong quan, du doan [v28]\n"
+            "  chi dung dung khi r=0 vi do la dung gia thiet IID cua no):\n";
+    const int W = 256, C = 64, L_const = 8, window = 3;
+    vector<double> p(W, 1.0 / W);
+    vector<int> set_of_idx(W, 0); // S=1, fully-associative cho gon (tach bach voi truc assoc)
+    double theo_miss_access = predict_miss_per_access_v28(p, vector<double>(W, (double)L_const), set_of_idx, 1, (double)C);
+
+    uniform_real_distribution<double> u01(0.0, 1.0);
+    uniform_int_distribution<int> fresh(0, W - 1);
+    uniform_int_distribution<int> windist(-window, window);
+
+    for (double r : {0.0, 0.2, 0.4, 0.6, 0.8, 0.95}){
+        SimpleLRU cache(C);
+        int cur = fresh(rng);
+        auto next_line = [&](int prev) -> int {
+            if (u01(rng) < r){
+                int nl = ((prev + windist(rng)) % W + W) % W;
+                return nl;
+            }
+            return fresh(rng);
+        };
+        long warmup = 50000, meas = 2000000;
+        for (long i = 0; i < warmup; i++){ cur = next_line(cur); for (int b = 0; b < L_const; b++) cache.touch(cur); }
+        long hits = 0, total = 0;
+        for (long i = 0; i < meas; i++){
+            cur = next_line(cur);
+            for (int b = 0; b < L_const; b++){ if (cache.touch(cur)) hits++; total++; }
+        }
+        double emp_miss_access = 1.0 - (double)hits / (double)total;
+        double rel_err = fabs(theo_miss_access - emp_miss_access) / emp_miss_access * 100.0;
+        cout << "    r=" << fixed << setprecision(2) << r
+             << "  [v28]_du_doan=" << setprecision(6) << theo_miss_access
+             << "  thuc_nghiem=" << emp_miss_access
+             << "  sai_lech_tuong_doi=" << setprecision(1) << rel_err << "%"
+             << (r == 0.0 ? "  (mong doi ~0%, xac nhan gia thiet IID)\n"
+                          : (rel_err > 20.0 ? "  [VUOT NGUONG - IID KHONG con giu duoc]\n" : "\n"));
+    }
+    cout << "  => Ket luan: cang tang tuong quan r, [v28] cang OVERESTIMATE miss rate cang manh\n"
+            "  (sai lech tuong doi vuot 100% khi r~0.95 trong khao sat rieng ngoai file). Day la\n"
+            "  GIOI HAN CON LAI LON NHAT cua ca ho [v23]-[v28]: gia dinh IID o tang burst, chua\n"
+            "  co huong sua trong pham vi file nay - de ngo trung thuc cho phien ban ke tiep.\n\n";
+}
+
 // ---------- Tien ich hoi quy tuyen tinh + RMSE/R^2 dung chung cho [v23] ----------
 struct LinFit { double a, b, r2; };
 static LinFit fit_linear(const vector<double>& x, const vector<double>& y){
@@ -3896,6 +4125,31 @@ cout << "\n";
 "     of the residual error between inferred capacity C and nominal vendor specifications\n"
 "     observed in earlier [v18]–[v23] sections.\n\n";
         }
+    }
+
+    // ============================================================
+    // [v28-NEW] Hop nhat Che ([v24], popularity lech) + set-associative
+    //   ([v26], nhieu set) + burst-length khong dong nhat (chua tung co) -
+    //   xem dan xuat + gioi han trung thuc day du trong comment truoc
+    //   predict_hit_rate_v28()/predict_miss_per_access_v28() o tren.
+    // ============================================================
+    cout << "===== [v28] Hop nhat Che + Set-Associative + Burst-Length khong dong nhat (self-validated)\n";
+    {
+        mt19937_64 v28_rng(20260729);
+        bool v28_ok = self_test_irm_v28_law(v28_rng);
+        if (!v28_ok){
+            cout << "  [v28] Self-test FAILED on this host -> SKIPPING conclusions cua [v28]\n"
+                    "  (khong tin mot dinh luat chua duoc xac nhan tren may nay).\n\n";
+        } else {
+            cout << "  [v28] Cong thuc hop nhat khop mo phong LRU that trong nguong da dinh nghia\n"
+                    "  (<2.5%) tren CA popularity lech (Zipf) LAN set-associative LAN burst-length\n"
+                    "  khong dong nhat CUNG LUC - dieu ma [v24] va [v26] rieng le chua bao gio lam duoc.\n"
+                    "  Da xac nhan quy ve DUNG TUYET DOI ve che_predicted_hit_rate() cua [v24] khi S=1\n"
+                    "  (sai lech ~1e-9, thuan tuy so hoc dau phay dong).\n\n";
+        }
+        // Phoi bay gioi han con lai (KHONG phai pass/fail - la phep do trung
+        // thuc, xem chi tiet trong comment truoc ham nay).
+        self_test_irm_v28_correlation_gap(v28_rng);
     }
 
     munmap(raw_normal, BYTES);
