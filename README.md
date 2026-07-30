@@ -93,8 +93,28 @@ AI models (e.g., xAI's Grok) often assume idealized execution models (pure pipel
 | **Infrastructure Noise / State Variance** | Neglected (Assumes $Var = 0$) | Isolated between-run variance ($\sigma_b^2$) | DVFS, SMT contention, and TLB misses introduce up to **15%+** noise if unisolated. |
 
 ---
+💡 Quick Integration Guide (C++20)
+Integrating deconfounded-popcount into your existing vector database or search engine requires zero external dependencies:
+```
+#include <iostream>
+#include <vector>
+#include "popcount_lib.hpp"
 
-## 🛠️ Quick Start
+int main() {
+    // 1. Initialize Engine (Automatic Runtime ISA Dispatch)
+    auto engine = deconfounded::PopcountEngine::create();
+
+    // 2. Prepare Data
+    std::vector<uint64_t> dataset(1'000'000, 0xFFFFFFFFFFFFFFFF);
+
+    // 3. High-Performance Execution
+    uint64_t total_bits = engine.compute_popcount(dataset.data(), dataset.size());
+
+    std::cout << "Total set bits: " << total_bits << std::endl;
+    return 0;
+}
+```
+## 🛠️ Build & Verification Setup
 
 System Requirements
 - Linux OS environment (required for sysfs, taskset, and RDTSCP cycle counters).
@@ -118,5 +138,11 @@ cmake --build build -j$(nproc)
 # Run LAB Microarchitectural Diagnostics & Kernel V39 Benchmark
 ./build/popcount_lab_demo
 ```
-📄 License
-This repository is distributed under the GNU General Public License v3.0 (GPLv3). For commercial B2B licensing (LIB/LAB licenses without copyleft constraints), please contact the core development team.
+💼 Commercial Licensing & Support
+This project is dual-licensed:
+
+Open-Source License (GPLv3): Free for open-source applications, academic research, and evaluation purposes under the terms of the GNU General Public License v3.0.
+
+Commercial License (B2B): For closed-source integration, proprietary vector search engine integration, commercial hardware deployments, or custom performance optimization SLA support without GPL copyleft restrictions.
+
+📩 Commercial & Enterprise Inquiries: Please contact ducksans40478@gmail.com or open a private business inquiry issue.
